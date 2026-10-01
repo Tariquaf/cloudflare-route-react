@@ -5,4 +5,4 @@ compatibility_date = "2026-09-30"
 # This starting value is just an example — once deployed, you'll edit the
 # real value in the Cloudflare dashboard instead of here (see README.md).
 [vars]
-ROUTES_JSON = "{\"/website\":\"mmmc-route-test.spilt-fiats0t.workers.dev\"}"
+ROUTES_JSON = "{\"/website\":\"https://mmmc-website.spilt-fiats0t.workers.dev\"}"
