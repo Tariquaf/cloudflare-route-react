@@ -87,10 +87,19 @@ export default {
       );
       body = body.replace(jsRewrite, `$1${BASE}/$2$3$1`);
 
+      // The rewritten body is a different length than the original —
+      // Content-Length (and Content-Encoding, if the original was
+      // compressed) from the upstream response no longer match, which
+      // makes the browser reject the response as corrupt. Drop both and
+      // let Cloudflare recalculate them for the new body.
+      const headers = new Headers(response.headers);
+      headers.delete("content-length");
+      headers.delete("content-encoding");
+
       return new Response(body, {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers
+        headers
       });
     }
 
