@@ -8,6 +8,13 @@
  * /blog        -> Blog website
  *
  * ROUTES_JSON controls everything.
+ *
+ * Example ROUTES_JSON:
+ *
+ * {
+ *   "/test": "https://rice-xxxxx.workers.dev",
+ *   "/blog": "https://blog-xxxxx.workers.dev"
+ * }
  */
 
 export default {
@@ -42,20 +49,7 @@ export default {
       .sort((a, b) => b.length - a.length)[0];
 
     // ------------------------------------------------------------
-    // 3. Optional default upstream
-    //
-    // This is useful when a site is being tested on a dedicated
-    // subdomain such as:
-    //
-    // rice.example.com/*
-    //
-    // and the SPA asks for:
-    //
-    // /images/...
-    // /brand/...
-    // /api/...
-    //
-    // Set DEFAULT_UPSTREAM only when appropriate.
+    // 3. Determine upstream
     // ------------------------------------------------------------
 
     let UPSTREAM;
@@ -70,6 +64,18 @@ export default {
 
     // ------------------------------------------------------------
     // 4. Remove the matched subpath
+    //
+    // /test
+    //       -> /
+    //
+    // /test/
+    //       -> /
+    //
+    // /test/api/products
+    //       -> /api/products
+    //
+    // /test/images/v2.jpg
+    //       -> /images/v2.jpg
     // ------------------------------------------------------------
 
     let path = url.pathname;
@@ -81,27 +87,46 @@ export default {
           : path.slice(BASE.length);
     }
 
-    const targetUrl = UPSTREAM + path + url.search;
+    const targetUrl =
+      UPSTREAM +
+      path +
+      url.search;
 
     // ------------------------------------------------------------
     // 5. Forward request
     // ------------------------------------------------------------
 
-    const upstreamRequest = new Request(targetUrl, request);
+    const upstreamRequest = new Request(
+      targetUrl,
+      request
+    );
 
-    let response = await fetch(upstreamRequest);
+    const response = await fetch(upstreamRequest);
 
     const contentType =
       response.headers.get("content-type") || "";
 
     // ------------------------------------------------------------
     // 6. Rewrite HTML
+    //
+    // Example:
+    //
+    // /assets/app.js
+    //       ->
+    // /test/assets/app.js
+    //
+    // /brand/logo.svg
+    //       ->
+    // /test/brand/logo.svg
     // ------------------------------------------------------------
 
-    if (BASE && contentType.includes("text/html")) {
-      const attrRewriter = (attr) => ({
+    if (
+      BASE &&
+      contentType.includes("text/html")
+    ) {
+      const rewriteAttribute = (attribute) => ({
         element(el) {
-          const value = el.getAttribute(attr);
+          const value = el.getAttribute(attribute);
 
           if (
             value &&
@@ -109,31 +134,48 @@ export default {
             !value.startsWith("//") &&
             !value.startsWith(BASE + "/")
           ) {
-            el.setAttribute(attr, BASE + value);
+            el.setAttribute(
+              attribute,
+              BASE + value
+            );
           }
         }
       });
 
       return new HTMLRewriter()
-        .on("[src]", attrRewriter("src"))
-        .on("[href]", attrRewriter("href"))
+        .on(
+          "[src]",
+          rewriteAttribute("src")
+        )
+        .on(
+          "[href]",
+          rewriteAttribute("href")
+        )
         .transform(response);
     }
 
     // ------------------------------------------------------------
     // 7. Rewrite JavaScript
     //
-    // React/Vite builds often contain:
+    // This is the important part for APIs.
     //
-    // "/images/x.jpg"
+    // Developer code such as:
+    //
+    // fetch("/api/products")
+    //
+    // becomes:
+    //
+    // fetch("/test/api/products")
+    //
+    // We do NOT need to know whether an API exists.
+    //
+    // The same mechanism also handles:
+    //
+    // "/images/v2.jpg"
     // "/brand/logo.svg"
-    // "/api/products"
-    //
-    // Convert these to:
-    //
-    // "/test/images/x.jpg"
-    // "/test/brand/logo.svg"
-    // "/test/api/products"
+    // "/assets/..."
+    // "/data/..."
+    // "/api/..."
     // ------------------------------------------------------------
 
     if (
@@ -148,10 +190,27 @@ export default {
 
       const baseNoSlash = BASE
         .slice(1)
-        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        .replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        );
+
+      /*
+       * Match quoted root-relative URLs:
+       *
+       * "/api/products"
+       * "/images/v2.jpg"
+       * '/brand/logo.svg'
+       * `/data/file.json`
+       *
+       * Do not modify:
+       *
+       * "//example.com/..."
+       * "/test/..."
+       */
 
       const jsRewrite = new RegExp(
-        `(["'\`])\\/(?!\\/|${baseNoSlash}\\/)([^"'\`?#]+)([?#]?[^"'\`]*)\\1`,
+        `(["'\`])\\/(?!\\/|${baseNoSlash}\\/)([^"'\\\`?#]+)([?#]?[^"'\\\`]*)\\1`,
         "g"
       );
 
@@ -160,7 +219,14 @@ export default {
         `$1${BASE}/$2$3$1`
       );
 
-      const headers = new Headers(response.headers);
+      const headers =
+        new Headers(response.headers);
+
+      /*
+       * The body has changed.
+       *
+       * These headers may now contain incorrect values.
+       */
 
       headers.delete("content-length");
       headers.delete("content-encoding");
@@ -174,6 +240,14 @@ export default {
 
     // ------------------------------------------------------------
     // 8. Rewrite CSS
+    //
+    // Example:
+    //
+    // url("/images/background.jpg")
+    //
+    // becomes:
+    //
+    // url("/test/images/background.jpg")
     // ------------------------------------------------------------
 
     if (
@@ -182,8 +256,15 @@ export default {
     ) {
       let body = await response.text();
 
+      const baseNoSlash = BASE
+        .slice(1)
+        .replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        );
+
       const cssRewrite = new RegExp(
-        `url\\(\\s*(["']?)\\/(?!\\/|${BASE.slice(1)}\\/)([^)"']+)\\1\\s*\\)`,
+        `url\\(\\s*(["']?)\\/(?!\\/|${baseNoSlash}\\/)([^)"']+)\\1\\s*\\)`,
         "g"
       );
 
@@ -192,7 +273,8 @@ export default {
         `url($1${BASE}/$2$1)`
       );
 
-      const headers = new Headers(response.headers);
+      const headers =
+        new Headers(response.headers);
 
       headers.delete("content-length");
       headers.delete("content-encoding");
@@ -205,7 +287,7 @@ export default {
     }
 
     // ------------------------------------------------------------
-    // 9. Pass everything else through
+    // 9. Everything else passes through unchanged
     // ------------------------------------------------------------
 
     return response;
