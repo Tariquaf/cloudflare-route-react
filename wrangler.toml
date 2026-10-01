@@ -1,4 +1,4 @@
-name = "add-router-react"
+name = 'add-route-react'
 main = "src/index.js"
 compatibility_date = "2026-09-28"
 
