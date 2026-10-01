@@ -1,11 +1,9 @@
 {
-  "name": "example-subpath-router",
-  "version": "1.0.0",
-  "private": true,
   "scripts": {
-    "deploy": "wrangler deploy"
-  },
-  "devDependencies": {
-    "wrangler": "^3.0.0"
+    "dev": "vite dev",
+    "build": "vite build && tsc --noEmit",
+    "preview": "vite preview",
+    "deploy": "npm run build && wrangler deploy",
+    "cf-typegen": "wrangler types"
   }
 }
