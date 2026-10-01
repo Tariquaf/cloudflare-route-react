@@ -1,8 +1,0 @@
-name = "example-subpath-router"
-main = "src/index.js"
-compatibility_date = "2026-09-28"
-
-# This starting value is just an example — once deployed, you'll edit the
-# real value in the Cloudflare dashboard instead of here (see README.md).
-[vars]
-ROUTES_JSON = "{\"/test\":\"https://pakrice-website.yourname.workers.dev\"}"
