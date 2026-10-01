@@ -1,22 +1,19 @@
 /**
- * Generic subpath router/proxy for Cloudflare Workers.
+ * Generic Cloudflare Worker subpath router/proxy
  *
- * Example:
+ * Examples:
  *
- * /test                    -> Rice website
- * /test/api/...            -> Rice API
- * /verification            -> Verification website
- * /verification/api/...   -> Verification API
- * /blog                    -> Blog website
+ * /verification/          -> verification Worker
+ * /verification/api/...   -> verification Worker /api/...
  *
- * ROUTES_JSON controls everything.
+ * /rice/                  -> rice Worker
+ * /rice/api/...           -> rice Worker /api/...
  *
- * Example:
+ * ROUTES_JSON example:
  *
  * {
- *   "/test": "https://rice-xxxxx.workers.dev",
- *   "/verification": "https://verification-xxxxx.workers.dev",
- *   "/blog": "https://blog-xxxxx.workers.dev"
+ *   "/verification": "https://verification.usman-agro7c.workers.dev",
+ *   "/rice": "https://rice-xxxxx.workers.dev"
  * }
  */
 
@@ -25,7 +22,7 @@ export default {
     const url = new URL(request.url);
 
     // ============================================================
-    // 1. Read routes
+    // 1. Read routing configuration
     // ============================================================
 
     let routes;
@@ -35,32 +32,38 @@ export default {
     } catch (err) {
       return new Response(
         "ROUTES_JSON is not valid JSON. Check Cloudflare Variables and Secrets.",
-        { status: 500 }
+        {
+          status: 500,
+          headers: {
+            "content-type": "text/plain; charset=UTF-8"
+          }
+        }
       );
     }
 
     // ============================================================
-    // 2. Find longest matching route
+    // 2. Find the longest matching application path
     // ============================================================
 
     const BASE = Object.keys(routes)
-      .filter(
-        (p) =>
+      .filter((p) => {
+        return (
           url.pathname === p ||
           url.pathname.startsWith(p + "/")
-      )
+        );
+      })
       .sort((a, b) => b.length - a.length)[0];
 
     // ============================================================
-    // 3. Determine upstream
+    // 3. Determine upstream Worker
     // ============================================================
 
     let UPSTREAM;
 
     if (BASE) {
-      UPSTREAM = String(routes[BASE]).replace(/\/$/, "");
+      UPSTREAM = String(routes[BASE]).replace(/\/+$/, "");
     } else if (env.DEFAULT_UPSTREAM) {
-      UPSTREAM = String(env.DEFAULT_UPSTREAM).replace(/\/$/, "");
+      UPSTREAM = String(env.DEFAULT_UPSTREAM).replace(/\/+$/, "");
     } else {
       return new Response("Not found", {
         status: 404
@@ -68,186 +71,33 @@ export default {
     }
 
     // ============================================================
-    // 4. Special runtime script
-    //
-    // This script is injected into path-mounted HTML.
-    //
-    // It catches API calls such as:
-    //
-    // fetch("/api/products")
-    //
-    // even when the URL is constructed dynamically and therefore
-    // cannot be detected by our JavaScript text replacement.
-    //
-    // Browser:
-    //
-    // /api/products
-    //
-    // becomes:
-    //
-    // /test/api/products
-    //
-    // The normal router then strips /test and sends:
-    //
-    // /api/products
-    //
-    // to the developer Worker.
+    // 4. Remove application prefix before forwarding upstream
     // ============================================================
 
-    if (
-      BASE &&
-      url.pathname === BASE + "/__router-runtime.js"
-    ) {
-      const runtime = `
-(() => {
-  const BASE = ${JSON.stringify(BASE)};
-
-  function rewriteURL(input) {
-    // ----------------------------------------------------------
-    // String URL
-    // ----------------------------------------------------------
-
-    if (typeof input === "string") {
-      if (
-        input.startsWith("/") &&
-        !input.startsWith("//") &&
-        !input.startsWith(BASE + "/") &&
-        input !== BASE
-      ) {
-        return BASE + input;
-      }
-
-      return input;
-    }
-
-    // ----------------------------------------------------------
-    // URL object
-    // ----------------------------------------------------------
-
-    if (input instanceof URL) {
-      if (
-        input.origin === window.location.origin &&
-        input.pathname.startsWith("/") &&
-        !input.pathname.startsWith(BASE + "/") &&
-        input.pathname !== BASE
-      ) {
-        const copy = new URL(input.href);
-
-        copy.pathname =
-          BASE +
-          (
-            copy.pathname === "/"
-              ? ""
-              : copy.pathname
-          );
-
-        return copy;
-      }
-
-      return input;
-    }
-
-    return input;
-  }
-
-  // ============================================================
-  // Intercept fetch()
-  // ============================================================
-
-  const originalFetch = window.fetch;
-
-  window.fetch = function(input, init) {
-    try {
-      if (typeof input === "string") {
-        input = rewriteURL(input);
-      } else if (input instanceof URL) {
-        input = rewriteURL(input);
-      } else if (input instanceof Request) {
-        const rewritten = rewriteURL(input.url);
-
-        if (rewritten !== input.url) {
-          input = new Request(rewritten, input);
-        }
-      }
-    } catch (e) {
-      // Never break the application because of the router.
-    }
-
-    return originalFetch.call(this, input, init);
-  };
-
-  // ============================================================
-  // Intercept XMLHttpRequest
-  // ============================================================
-
-  const originalOpen = XMLHttpRequest.prototype.open;
-
-  XMLHttpRequest.prototype.open = function(
-    method,
-    requestURL,
-    async,
-    username,
-    password
-  ) {
-    try {
-      requestURL = rewriteURL(requestURL);
-    } catch (e) {
-      // Leave the original URL untouched.
-    }
-
-    return originalOpen.call(
-      this,
-      method,
-      requestURL,
-      async,
-      username,
-      password
-    );
-  };
-})();
-`;
-
-      return new Response(runtime, {
-        status: 200,
-        headers: {
-          "content-type": "application/javascript; charset=UTF-8",
-          "cache-control": "public, max-age=300"
-        }
-      });
-    }
-
-    // ============================================================
-    // 5. Remove matched subpath before forwarding
-    //
-    // /test
-    //        -> /
-    //
-    // /test/
-    //        -> /
-    //
-    // /test/api/products
-    //        -> /api/products
-    //
-    // /test/images/v2.jpg
-    //        -> /images/v2.jpg
-    // ============================================================
-
-    let path = url.pathname;
+    let upstreamPath = url.pathname;
 
     if (BASE) {
-      path =
-        path === BASE || path === BASE + "/"
-          ? "/"
-          : path.slice(BASE.length);
+      if (
+        upstreamPath === BASE ||
+        upstreamPath === BASE + "/"
+      ) {
+        upstreamPath = "/";
+      } else {
+        upstreamPath = upstreamPath.slice(BASE.length);
+
+        if (!upstreamPath.startsWith("/")) {
+          upstreamPath = "/" + upstreamPath;
+        }
+      }
     }
 
     const targetUrl =
       UPSTREAM +
-      path +
+      upstreamPath +
       url.search;
 
     // ============================================================
-    // 6. Forward request
+    // 5. Forward request
     // ============================================================
 
     const upstreamRequest = new Request(
@@ -255,25 +105,113 @@ export default {
       request
     );
 
-    const response = await fetch(upstreamRequest);
+    let response;
+
+    try {
+      response = await fetch(upstreamRequest);
+    } catch (err) {
+      return new Response(
+        "Upstream request failed.",
+        {
+          status: 502,
+          headers: {
+            "content-type": "text/plain; charset=UTF-8"
+          }
+        }
+      );
+    }
 
     const contentType =
       response.headers.get("content-type") || "";
 
     // ============================================================
-    // 7. Rewrite HTML
+    // 6. Copy response headers
+    // ============================================================
+
+    const headers = new Headers(response.headers);
+
+    // We modify response bodies below, so these are no longer valid.
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+
+    // ============================================================
+    // 7. Rewrite redirects
     //
-    // Root-relative resources:
+    // Example upstream:
+    //
+    // Location: /login
+    //
+    // becomes:
+    //
+    // Location: /verification/login
+    // ============================================================
+
+    if (BASE) {
+      const location = headers.get("location");
+
+      if (
+        location &&
+        location.startsWith("/") &&
+        !location.startsWith("//") &&
+        !location.startsWith(BASE + "/") &&
+        location !== BASE
+      ) {
+        headers.set(
+          "location",
+          BASE + location
+        );
+      }
+    }
+
+    // ============================================================
+    // 8. Rewrite cookies
+    //
+    // Important for API applications using authentication/session
+    // cookies.
+    //
+    // Upstream:
+    //
+    // Set-Cookie: session=abc; Path=/; HttpOnly
+    //
+    // becomes:
+    //
+    // Set-Cookie: session=abc; Path=/verification; HttpOnly
+    // ============================================================
+
+    if (BASE) {
+      const cookies = headers.getSetCookie
+        ? headers.getSetCookie()
+        : [];
+
+      if (cookies.length > 0) {
+        headers.delete("set-cookie");
+
+        for (const cookie of cookies) {
+          const rewrittenCookie = cookie.replace(
+            /;\s*Path=\//i,
+            `; Path=${BASE}/`
+          );
+
+          headers.append(
+            "set-cookie",
+            rewrittenCookie
+          );
+        }
+      }
+    }
+
+    // ============================================================
+    // 9. HTML
+    //
+    // Rewrite:
     //
     // /assets/app.js
-    //        ->
-    // /test/assets/app.js
     //
-    // /brand/logo.svg
-    //        ->
-    // /test/brand/logo.svg
+    // to:
     //
-    // Also inject the runtime API interceptor.
+    // /verification/assets/app.js
+    //
+    // Also handles href/src/preload/etc.
     // ============================================================
 
     if (
@@ -282,12 +220,14 @@ export default {
     ) {
       const rewriteAttribute = (attribute) => ({
         element(el) {
-          const value = el.getAttribute(attribute);
+          const value =
+            el.getAttribute(attribute);
 
           if (
             value &&
             value.startsWith("/") &&
             !value.startsWith("//") &&
+            value !== BASE &&
             !value.startsWith(BASE + "/")
           ) {
             el.setAttribute(
@@ -299,48 +239,44 @@ export default {
       });
 
       return new HTMLRewriter()
-
-        // Rewrite src=""
-        .on(
-          "[src]",
-          rewriteAttribute("src")
-        )
-
-        // Rewrite href=""
-        .on(
-          "[href]",
-          rewriteAttribute("href")
-        )
-
-        // Inject our generic runtime before </head>
-        .on("head", {
-          element(el) {
-            el.append(
-              `<script src="${BASE}/__router-runtime.js"></script>`,
-              {
-                html: true
-              }
-            );
-          }
-        })
-
-        .transform(response);
+        .on("[src]", rewriteAttribute("src"))
+        .on("[href]", rewriteAttribute("href"))
+        .on("[action]", rewriteAttribute("action"))
+        .transform(
+          new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers
+          })
+        );
     }
 
     // ============================================================
-    // 8. Rewrite JavaScript
+    // 10. JavaScript
     //
-    // This remains as an additional layer.
+    // This is the important part for API-enabled SPAs.
     //
-    // It handles literal URLs such as:
+    // Example:
     //
-    // "/api/products"
-    // "/images/v2.jpg"
-    // "/brand/logo.svg"
-    // "/data/products.json"
+    // fetch("/api/products")
     //
-    // The runtime interceptor above handles dynamically
-    // constructed API URLs.
+    // becomes:
+    //
+    // fetch("/verification/api/products")
+    //
+    // Also catches:
+    //
+    // axios.get("/api/products")
+    // new URL("/api/products", ...)
+    // "/images/photo.jpg"
+    // "/data/config.json"
+    // `/api/products/${id}`
+    //
+    // External URLs such as:
+    //
+    // https://api.example.com/...
+    //
+    // are NOT changed.
     // ============================================================
 
     if (
@@ -348,33 +284,61 @@ export default {
       (
         contentType.includes("javascript") ||
         contentType.includes("application/javascript") ||
-        contentType.includes("text/javascript")
+        contentType.includes("text/javascript") ||
+        contentType.includes("application/x-javascript")
       )
     ) {
       let body = await response.text();
 
-      const baseNoSlash = BASE
-        .slice(1)
-        .replace(
+      const escapedBase =
+        BASE.replace(
           /[.*+?^${}()|[\]\\]/g,
           "\\$&"
         );
 
-      const jsRewrite = new RegExp(
-        `(["'\`])\\/(?!\\/|${baseNoSlash}\\/)([^"'\\\`?#]+)([?#]?[^"'\\\`]*)\\1`,
-        "g"
-      );
+      // ----------------------------------------------------------
+      // Double-quoted strings
+      // ----------------------------------------------------------
 
       body = body.replace(
-        jsRewrite,
-        `$1${BASE}/$2$3$1`
+        new RegExp(
+          `(["])\\/(?!\\/|${escapedBase}(?:\\/|"))`,
+          "g"
+        ),
+        `$1${BASE}/`
       );
 
-      const headers =
-        new Headers(response.headers);
+      // ----------------------------------------------------------
+      // Single-quoted strings
+      // ----------------------------------------------------------
 
-      headers.delete("content-length");
-      headers.delete("content-encoding");
+      body = body.replace(
+        new RegExp(
+          `(['])\\/(?!\\/|${escapedBase}(?:\\/|'))`,
+          "g"
+        ),
+        `$1${BASE}/`
+      );
+
+      // ----------------------------------------------------------
+      // Template literals
+      //
+      // `/api/${id}`
+      //
+      // becomes:
+      //
+      // `/verification/api/${id}`
+      // ----------------------------------------------------------
+
+      body = body.replace(
+        new RegExp(
+          "(`)\\/(?!\\/|" +
+          escapedBase +
+          "(?:\\/|`))",
+          "g"
+        ),
+        `$1${BASE}/`
+      );
 
       return new Response(body, {
         status: response.status,
@@ -384,13 +348,15 @@ export default {
     }
 
     // ============================================================
-    // 9. Rewrite CSS
+    // 11. CSS
     //
-    // url("/images/background.jpg")
+    // Rewrite:
     //
-    // becomes:
+    // url("/images/logo.svg")
     //
-    // url("/test/images/background.jpg")
+    // to:
+    //
+    // url("/verification/images/logo.svg")
     // ============================================================
 
     if (
@@ -399,28 +365,19 @@ export default {
     ) {
       let body = await response.text();
 
-      const baseNoSlash = BASE
-        .slice(1)
-        .replace(
+      const escapedBase =
+        BASE.replace(
           /[.*+?^${}()|[\]\\]/g,
           "\\$&"
         );
 
-      const cssRewrite = new RegExp(
-        `url\\(\\s*(["']?)\\/(?!\\/|${baseNoSlash}\\/)([^)"']+)\\1\\s*\\)`,
-        "g"
-      );
-
       body = body.replace(
-        cssRewrite,
+        new RegExp(
+          `url\$begin:math:text$\\\\s\*\(\[\"\'\]\?\)\\\\\/\(\?\!\\\\\/\|\$\{escapedBase\}\\\\\/\)\(\[\^\)\"\'\]\+\)\\\\1\\\\s\*\\$end:math:text$`,
+          "g"
+        ),
         `url($1${BASE}/$2$1)`
       );
-
-      const headers =
-        new Headers(response.headers);
-
-      headers.delete("content-length");
-      headers.delete("content-encoding");
 
       return new Response(body, {
         status: response.status,
@@ -430,9 +387,13 @@ export default {
     }
 
     // ============================================================
-    // 10. Everything else passes through unchanged
+    // 12. Everything else passes through unchanged
     // ============================================================
 
-    return response;
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
   }
 };
