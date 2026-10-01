@@ -5,7 +5,7 @@
 You have one main domain, `example.com`. Over time you want to add extra
 websites at different "folders" of that domain — for example:
 
-- `example.com/test` → a rice-export website
+- `example.com/test` → a test website
 - `example.com/blog` → a blog, added later
 - `example.com/shop` → a shop, added even later
 
