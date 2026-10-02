@@ -75,10 +75,22 @@ export default {
 
     const targetUrl = UPSTREAM + upstreamPath + url.search;
 
-    // 5. Forward request
+    // 5. Forward request (without conditional headers, so upstream
+    //    never answers 304 and we always get a body to rewrite)
     let response;
     try {
-      response = await fetch(new Request(targetUrl, request));
+      const upstreamHeaders = new Headers(request.headers);
+      upstreamHeaders.delete("if-none-match");
+      upstreamHeaders.delete("if-modified-since");
+
+      response = await fetch(
+        new Request(targetUrl, {
+          method: request.method,
+          headers: upstreamHeaders,
+          body: request.body,
+          redirect: request.redirect
+        })
+      );
     } catch (err) {
       return textResponse("Unable to reach upstream application.", 502);
     }
@@ -89,6 +101,7 @@ export default {
     const headers = new Headers(response.headers);
     headers.delete("content-length");
     headers.delete("content-encoding");
+    headers.set("x-router-version", "3");
 
     // Helper: is this a root path that still needs the prefix?
     const needsPrefix = function (value) {
@@ -151,8 +164,9 @@ export default {
         .transform(htmlResponse);
     }
 
-    // 10. JavaScript: only prefix quoted root paths that point to FILES
-    //     (images, video, fonts, pdf). Route paths are never changed.
+    // 10. JavaScript: prefix root paths that point to FILES
+    //     (images, video, fonts, pdf), whether written as "/x.jpg",
+    //     '/x.jpg', `/x.jpg` or url(/x.jpg). Route paths are never changed.
     if (
       BASE &&
       (contentType.includes("javascript") ||
@@ -161,17 +175,21 @@ export default {
       let body = await response.text();
 
       const fileRegex = new RegExp(
-        "([\"'`])\\/(?!\\/)([^\"'`\\s\\\\]*\\.(?:" + FILE_EXT + "))(?=\\1)",
-        "g"
+        "([\"'`(])\\/(?!\\/)([^\"'`()\\s\\\\]*\\.(?:" +
+          FILE_EXT +
+          "))(?![A-Za-z0-9_])",
+        "gi"
       );
 
-      body = body.replace(fileRegex, function (match, quote, rest) {
+      body = body.replace(fileRegex, function (match, open, rest) {
         const full = "/" + rest;
         if (full === BASE || full.startsWith(BASE + "/")) {
           return match;
         }
-        return quote + BASE + full;
+        return open + BASE + full;
       });
+
+      headers.set("cache-control", "no-cache");
 
       return new Response(body, {
         status: response.status,
@@ -194,6 +212,8 @@ export default {
           return "url(" + quote + BASE + full + quote + ")";
         }
       );
+
+      headers.set("cache-control", "no-cache");
 
       return new Response(body, {
         status: response.status,
