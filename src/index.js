@@ -1,13 +1,18 @@
 /**
- * Generic Cloudflare Worker subpath router/proxy.
+ * Generic Cloudflare Worker subpath router/proxy (v4).
  *
- * ROUTES_JSON example:
+ * ROUTES_JSON example (addresses only, no path, no query):
  * {
  *   "/website": "https://website.yourname.workers.dev",
- *   "/verification": "https://verification.yourname.workers.dev"
+ *   "/delivery": "https://delivery-receipt.yourname.workers.dev"
  * }
  *
- * /website/images/a.jpg -> website Worker /images/a.jpg
+ * 1) /delivery/x      -> delivery Worker /x
+ * 2) /_proxy/<host>/x -> https://<host>/x
+ *    Only for hosts under the same workers.dev account as a
+ *    ROUTES_JSON entry. App JavaScript that calls those hosts
+ *    directly is rewritten to use /_proxy/<host>, so cookies and
+ *    CORS work without extra configuration.
  */
 
 const FILE_EXT =
@@ -18,6 +23,47 @@ function textResponse(message, status) {
     status: status,
     headers: { "content-type": "text/plain; charset=UTF-8" }
   });
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Work out which upstream hosts the router may proxy to.
+function buildAllowed(routes) {
+  const hosts = new Set();
+  const suffixes = new Set();
+
+  for (const key of Object.keys(routes)) {
+    try {
+      const hostname = new URL(String(routes[key])).hostname.toLowerCase();
+      hosts.add(hostname);
+
+      const parts = hostname.split(".");
+      if (hostname.endsWith(".workers.dev") && parts.length >= 4) {
+        suffixes.add(parts.slice(1).join("."));
+      }
+    } catch (err) {
+      // ignore invalid entries
+    }
+  }
+
+  return { hosts: hosts, suffixes: Array.from(suffixes) };
+}
+
+function isAllowedHost(host, allowed) {
+  if (!/^[a-z0-9.-]+$/.test(host)) {
+    return false;
+  }
+  if (allowed.hosts.has(host)) {
+    return true;
+  }
+  for (const suffix of allowed.suffixes) {
+    if (host.endsWith("." + suffix)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export default {
@@ -39,49 +85,73 @@ export default {
       return textResponse("ROUTES_JSON must contain a JSON object.", 500);
     }
 
-    // 2. Longest matching route
-    const BASE = Object.keys(routes)
-      .filter(function (path) {
-        return (
-          url.pathname === path || url.pathname.startsWith(path + "/")
-        );
-      })
-      .sort(function (a, b) {
-        return b.length - a.length;
-      })[0];
+    const allowed = buildAllowed(routes);
 
-    // 3. Upstream
+    // 2. Decide where this request goes
+    let BASE;
+    let PREFIX;
     let UPSTREAM;
-    if (BASE) {
-      UPSTREAM = String(routes[BASE]).replace(/\/+$/, "");
-    } else if (env.DEFAULT_UPSTREAM) {
-      UPSTREAM = String(env.DEFAULT_UPSTREAM).replace(/\/+$/, "");
-    } else {
-      return textResponse("Not found", 404);
-    }
+    let upstreamPath;
+    let isProxy = false;
 
-    // 4. Strip the prefix
-    let upstreamPath = url.pathname;
-    if (BASE) {
-      if (upstreamPath === BASE || upstreamPath === BASE + "/") {
-        upstreamPath = "/";
-      } else {
-        upstreamPath = upstreamPath.slice(BASE.length);
-        if (!upstreamPath.startsWith("/")) {
-          upstreamPath = "/" + upstreamPath;
+    if (url.pathname.startsWith("/_proxy/")) {
+      // ---- Generic proxy mode ----
+      const rest = url.pathname.slice("/_proxy/".length);
+      const slash = rest.indexOf("/");
+      const host = (slash === -1 ? rest : rest.slice(0, slash)).toLowerCase();
+
+      if (!isAllowedHost(host, allowed)) {
+        return textResponse("Host not allowed", 403);
+      }
+
+      isProxy = true;
+      PREFIX = "/_proxy/" + host;
+      UPSTREAM = "https://" + host;
+      upstreamPath = slash === -1 ? "/" : rest.slice(slash);
+    } else {
+      // ---- Subpath route mode ----
+      BASE = Object.keys(routes)
+        .filter(function (path) {
+          return (
+            url.pathname === path || url.pathname.startsWith(path + "/")
+          );
+        })
+        .sort(function (a, b) {
+          return b.length - a.length;
+        })[0];
+
+      if (BASE) {
+        PREFIX = BASE;
+        UPSTREAM = String(routes[BASE]).replace(/\/+$/, "");
+
+        if (url.pathname === BASE || url.pathname === BASE + "/") {
+          upstreamPath = "/";
+        } else {
+          upstreamPath = url.pathname.slice(BASE.length);
+          if (!upstreamPath.startsWith("/")) {
+            upstreamPath = "/" + upstreamPath;
+          }
         }
+      } else if (env.DEFAULT_UPSTREAM) {
+        UPSTREAM = String(env.DEFAULT_UPSTREAM).replace(/\/+$/, "");
+        upstreamPath = url.pathname;
+      } else {
+        return textResponse("Not found", 404);
       }
     }
 
     const targetUrl = UPSTREAM + upstreamPath + url.search;
 
-    // 5. Forward request (without conditional headers, so upstream
-    //    never answers 304 and we always get a body to rewrite)
+    // 3. Forward request
     let response;
     try {
       const upstreamHeaders = new Headers(request.headers);
-      upstreamHeaders.delete("if-none-match");
-      upstreamHeaders.delete("if-modified-since");
+
+      // For rewritten sites, never let upstream answer 304 with no body.
+      if (!isProxy) {
+        upstreamHeaders.delete("if-none-match");
+        upstreamHeaders.delete("if-modified-since");
+      }
 
       response = await fetch(
         new Request(targetUrl, {
@@ -97,50 +167,81 @@ export default {
 
     const contentType = response.headers.get("content-type") || "";
 
-    // 6. Copy headers
+    // 4. Copy headers
     const headers = new Headers(response.headers);
     headers.delete("content-length");
     headers.delete("content-encoding");
-    headers.set("x-router-version", "3");
-    headers.set("x-router-target", targetUrl);
-    headers.set("x-router-upstream-status", String(response.status));
+    headers.set("x-router-version", "4");
 
-    // Helper: is this a root path that still needs the prefix?
+    // Helper: root path that still needs the prefix?
     const needsPrefix = function (value) {
       return (
-        BASE &&
+        PREFIX &&
         value &&
         value.startsWith("/") &&
         !value.startsWith("//") &&
-        value !== BASE &&
-        !value.startsWith(BASE + "/")
+        value !== PREFIX &&
+        !value.startsWith(PREFIX + "/")
       );
     };
 
-    // 7. Rewrite redirects
-    if (BASE) {
-      const location = headers.get("location");
+    // 5. Rewrite redirects
+    const location = headers.get("location");
+    if (location) {
       if (needsPrefix(location)) {
-        headers.set("location", BASE + location);
-      }
-    }
+        headers.set("location", PREFIX + location);
+      } else if (/^https?:\/\//i.test(location)) {
+        try {
+          const loc = new URL(location);
+          const rest = loc.pathname + loc.search + loc.hash;
 
-    // 8. Rewrite Set-Cookie Path
-    if (BASE && typeof headers.getSetCookie === "function") {
-      const cookies = headers.getSetCookie();
-      if (cookies.length > 0) {
-        headers.delete("set-cookie");
-        for (const cookie of cookies) {
-          headers.append(
-            "set-cookie",
-            cookie.replace(/;\s*Path=\//i, "; Path=" + BASE + "/")
-          );
+          if (PREFIX && loc.host === new URL(UPSTREAM).host) {
+            headers.set("location", PREFIX + rest);
+          } else if (isAllowedHost(loc.hostname.toLowerCase(), allowed)) {
+            headers.set(
+              "location",
+              url.origin + "/_proxy/" + loc.hostname.toLowerCase() + rest
+            );
+          }
+        } catch (err) {
+          // leave location unchanged
         }
       }
     }
 
-    // 9. HTML rewriting
-    if (BASE && contentType.includes("text/html")) {
+    // 6. Rewrite Set-Cookie (scope to prefix, drop Domain)
+    if (PREFIX && typeof headers.getSetCookie === "function") {
+      const cookies = headers.getSetCookie();
+      if (cookies.length > 0) {
+        headers.delete("set-cookie");
+        for (const cookie of cookies) {
+          let rewritten = cookie.replace(/;\s*Domain=[^;]*/i, "");
+
+          if (/;\s*Path=/i.test(rewritten)) {
+            rewritten = rewritten.replace(
+              /;\s*Path=\//i,
+              "; Path=" + PREFIX + "/"
+            );
+          } else {
+            rewritten = rewritten + "; Path=" + PREFIX + "/";
+          }
+
+          headers.append("set-cookie", rewritten);
+        }
+      }
+    }
+
+    // Proxy mode: no body rewriting
+    if (isProxy || !BASE) {
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: headers
+      });
+    }
+
+    // 7. HTML rewriting
+    if (contentType.includes("text/html")) {
       const rewriteAttribute = function (attribute) {
         return {
           element(el) {
@@ -166,16 +267,25 @@ export default {
         .transform(htmlResponse);
     }
 
-    // 10. JavaScript: prefix root paths that point to FILES
-    //     (images, video, fonts, pdf), whether written as "/x.jpg",
-    //     '/x.jpg', `/x.jpg` or url(/x.jpg). Route paths are never changed.
+    // 8. JavaScript rewriting
     if (
-      BASE &&
-      (contentType.includes("javascript") ||
-        contentType.includes("ecmascript"))
+      contentType.includes("javascript") ||
+      contentType.includes("ecmascript")
     ) {
       let body = await response.text();
 
+      // 8a. Calls to your other Workers go through /_proxy/<host>
+      for (const suffix of allowed.suffixes) {
+        const hostRegex = new RegExp(
+          "https?:\\/\\/([a-z0-9-]+\\." + escapeRegex(suffix) + ")",
+          "gi"
+        );
+        body = body.replace(hostRegex, function (match, host) {
+          return url.origin + "/_proxy/" + host.toLowerCase();
+        });
+      }
+
+      // 8b. Root-relative file paths (images, fonts, video, pdf)
       const fileRegex = new RegExp(
         "([\"'`(])\\/(?!\\/)([^\"'`()\\s\\\\]*\\.(?:" +
           FILE_EXT +
@@ -186,6 +296,9 @@ export default {
       body = body.replace(fileRegex, function (match, open, rest) {
         const full = "/" + rest;
         if (full === BASE || full.startsWith(BASE + "/")) {
+          return match;
+        }
+        if (full.startsWith("/_proxy/")) {
           return match;
         }
         return open + BASE + full;
@@ -200,8 +313,8 @@ export default {
       });
     }
 
-    // 11. CSS rewriting
-    if (BASE && contentType.includes("text/css")) {
+    // 9. CSS rewriting
+    if (contentType.includes("text/css")) {
       let body = await response.text();
 
       body = body.replace(
@@ -224,7 +337,7 @@ export default {
       });
     }
 
-    // 12. Everything else passes through
+    // 10. Everything else passes through
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
