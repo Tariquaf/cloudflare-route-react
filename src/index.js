@@ -102,6 +102,8 @@ export default {
     headers.delete("content-length");
     headers.delete("content-encoding");
     headers.set("x-router-version", "3");
+    headers.set("x-router-target", targetUrl);
+    headers.set("x-router-upstream-status", String(response.status));
 
     // Helper: is this a root path that still needs the prefix?
     const needsPrefix = function (value) {
