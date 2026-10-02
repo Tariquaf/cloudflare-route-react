@@ -1,20 +1,39 @@
 /**
- * Generic Cloudflare Worker subpath router/proxy
+ * Generic Cloudflare Worker subpath router/proxy.
  *
- * Examples:
- *
- * /verification/          -> verification Worker
- * /verification/api/...   -> verification Worker /api/...
- *
- * /rice/                  -> rice Worker
- * /rice/api/...           -> rice Worker /api/...
- *
- * ROUTES_JSON example:
+ * Example ROUTES_JSON:
  *
  * {
  *   "/verification": "https://verification.usman-agro7c.workers.dev",
- *   "/rice": "https://rice-xxxxx.workers.dev"
+ *   "/rice": "https://rice-xxxxx.workers.dev",
+ *   "/blog": "https://blog-xxxxx.workers.dev"
  * }
+ *
+ * Requests:
+ *
+ *   /verification/
+ *       -> verification Worker /
+ *
+ *   /verification/assets/app.js
+ *       -> verification Worker /assets/app.js
+ *
+ *   /verification/api/verify
+ *       -> verification Worker /api/verify
+ *
+ *   /rice/images/v1.jpg
+ *       -> rice Worker /images/v1.jpg
+ *
+ * The router does NOT need to know whether something is:
+ *
+ *   /api
+ *   /assets
+ *   /images
+ *   /data
+ *   /brand
+ *   /anything
+ *
+ * Everything belonging to the application is handled by its
+ * configured base path.
  */
 
 export default {
@@ -22,7 +41,7 @@ export default {
     const url = new URL(request.url);
 
     // ============================================================
-    // 1. Read routing configuration
+    // 1. Read ROUTES_JSON
     // ============================================================
 
     let routes;
@@ -41,21 +60,50 @@ export default {
       );
     }
 
+    // Make sure we have an object.
+    if (
+      !routes ||
+      typeof routes !== "object" ||
+      Array.isArray(routes)
+    ) {
+      return new Response(
+        "ROUTES_JSON must contain a JSON object.",
+        {
+          status: 500,
+          headers: {
+            "content-type": "text/plain; charset=UTF-8"
+          }
+        }
+      );
+    }
+
     // ============================================================
-    // 2. Find the longest matching application path
+    // 2. Find the longest matching route
+    // ============================================================
+    //
+    // Example:
+    //
+    // /verification
+    // /verification/admin
+    //
+    // For:
+    //
+    // /verification/admin/users
+    //
+    // /verification/admin wins because it is the longest match.
     // ============================================================
 
     const BASE = Object.keys(routes)
-      .filter((p) => {
+      .filter((path) => {
         return (
-          url.pathname === p ||
-          url.pathname.startsWith(p + "/")
+          url.pathname === path ||
+          url.pathname.startsWith(path + "/")
         );
       })
       .sort((a, b) => b.length - a.length)[0];
 
     // ============================================================
-    // 3. Determine upstream Worker
+    // 3. Determine upstream
     // ============================================================
 
     let UPSTREAM;
@@ -71,7 +119,16 @@ export default {
     }
 
     // ============================================================
-    // 4. Remove application prefix before forwarding upstream
+    // 4. Remove the application prefix
+    // ============================================================
+    //
+    // Public:
+    //
+    // /verification/api/test
+    //
+    // becomes upstream:
+    //
+    // /api/test
     // ============================================================
 
     let upstreamPath = url.pathname;
@@ -100,18 +157,18 @@ export default {
     // 5. Forward request
     // ============================================================
 
-    const upstreamRequest = new Request(
-      targetUrl,
-      request
-    );
-
     let response;
 
     try {
+      const upstreamRequest = new Request(
+        targetUrl,
+        request
+      );
+
       response = await fetch(upstreamRequest);
     } catch (err) {
       return new Response(
-        "Upstream request failed.",
+        "Unable to reach upstream application.",
         {
           status: 502,
           headers: {
@@ -121,29 +178,37 @@ export default {
       );
     }
 
+    // ============================================================
+    // 6. Content type
+    // ============================================================
+
     const contentType =
       response.headers.get("content-type") || "";
 
     // ============================================================
-    // 6. Copy response headers
+    // 7. Copy headers
     // ============================================================
 
     const headers = new Headers(response.headers);
 
-    // We modify response bodies below, so these are no longer valid.
+    // We may modify the body below.
+    // These headers must not describe the old body.
     headers.delete("content-length");
     headers.delete("content-encoding");
 
     // ============================================================
-    // 7. Rewrite redirects
+    // 8. Rewrite redirects
+    // ============================================================
     //
-    // Example upstream:
+    // Upstream:
     //
     // Location: /login
     //
-    // becomes:
+    // Public:
     //
     // Location: /verification/login
+    //
+    // This is important for authentication-enabled applications.
     // ============================================================
 
     if (BASE) {
@@ -153,8 +218,8 @@ export default {
         location &&
         location.startsWith("/") &&
         !location.startsWith("//") &&
-        !location.startsWith(BASE + "/") &&
-        location !== BASE
+        location !== BASE &&
+        !location.startsWith(BASE + "/")
       ) {
         headers.set(
           "location",
@@ -164,10 +229,8 @@ export default {
     }
 
     // ============================================================
-    // 8. Rewrite cookies
-    //
-    // Important for API applications using authentication/session
-    // cookies.
+    // 9. Rewrite Set-Cookie Path
+    // ============================================================
     //
     // Upstream:
     //
@@ -175,13 +238,17 @@ export default {
     //
     // becomes:
     //
-    // Set-Cookie: session=abc; Path=/verification; HttpOnly
+    // Set-Cookie: session=abc; Path=/verification/; HttpOnly
+    //
+    // This is needed by some API/authentication applications.
     // ============================================================
 
     if (BASE) {
-      const cookies = headers.getSetCookie
-        ? headers.getSetCookie()
-        : [];
+      let cookies = [];
+
+      if (typeof headers.getSetCookie === "function") {
+        cookies = headers.getSetCookie();
+      }
 
       if (cookies.length > 0) {
         headers.delete("set-cookie");
@@ -201,17 +268,24 @@ export default {
     }
 
     // ============================================================
-    // 9. HTML
+    // 10. HTML rewriting
+    // ============================================================
     //
-    // Rewrite:
+    // Handles:
     //
-    // /assets/app.js
+    //   <script src="/assets/app.js">
+    //   <link href="/assets/app.css">
+    //   <img src="/images/logo.svg">
+    //   <a href="/login">
+    //   <form action="/api/login">
     //
-    // to:
+    // becoming:
     //
-    // /verification/assets/app.js
-    //
-    // Also handles href/src/preload/etc.
+    //   /verification/assets/app.js
+    //   /verification/assets/app.css
+    //   /verification/images/logo.svg
+    //   /verification/login
+    //   /verification/api/login
     // ============================================================
 
     if (
@@ -220,8 +294,7 @@ export default {
     ) {
       const rewriteAttribute = (attribute) => ({
         element(el) {
-          const value =
-            el.getAttribute(attribute);
+          const value = el.getAttribute(attribute);
 
           if (
             value &&
@@ -238,54 +311,69 @@ export default {
         }
       });
 
+      const htmlResponse = new Response(
+        response.body,
+        {
+          status: response.status,
+          statusText: response.statusText,
+          headers
+        }
+      );
+
       return new HTMLRewriter()
         .on("[src]", rewriteAttribute("src"))
         .on("[href]", rewriteAttribute("href"))
         .on("[action]", rewriteAttribute("action"))
-        .transform(
-          new Response(response.body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers
-          })
-        );
+        .transform(htmlResponse);
     }
 
     // ============================================================
-    // 10. JavaScript
+    // 11. JavaScript rewriting
+    // ============================================================
     //
-    // This is the important part for API-enabled SPAs.
+    // This is the main API-related fix.
     //
     // Example:
     //
-    // fetch("/api/products")
+    // fetch("/api/verify")
     //
     // becomes:
     //
-    // fetch("/verification/api/products")
+    // fetch("/verification/api/verify")
     //
-    // Also catches:
+    // Also handles:
     //
-    // axios.get("/api/products")
-    // new URL("/api/products", ...)
-    // "/images/photo.jpg"
-    // "/data/config.json"
-    // `/api/products/${id}`
+    // axios.get("/api/verify")
+    // fetch("/data/config.json")
+    // "/images/logo.svg"
+    // `/api/document/${id}`
     //
-    // External URLs such as:
+    // External URLs are NOT changed:
     //
-    // https://api.example.com/...
+    // https://api.example.com/verify
+    // //cdn.example.com/file.js
     //
-    // are NOT changed.
+    // ------------------------------------------------------------
+    //
+    // Stage 2:
+    //
+    // We also handle common URL construction patterns such as:
+    //
+    // new URL("/api/test", ...)
+    //
+    // because the root-relative string itself is rewritten.
+    //
+    // We deliberately do NOT attempt to parse JavaScript with a
+    // regex-based full parser. The goal is to make minimal changes
+    // to Vite-generated bundles while preserving valid JavaScript.
     // ============================================================
 
     if (
       BASE &&
       (
         contentType.includes("javascript") ||
-        contentType.includes("application/javascript") ||
-        contentType.includes("text/javascript") ||
-        contentType.includes("application/x-javascript")
+        contentType.includes("ecmascript") ||
+        contentType.includes("x-javascript")
       )
     ) {
       let body = await response.text();
@@ -297,37 +385,46 @@ export default {
         );
 
       // ----------------------------------------------------------
-      // Double-quoted strings
+      // Stage 1:
+      // Double-quoted root-relative strings
       // ----------------------------------------------------------
 
       body = body.replace(
         new RegExp(
-          `(["])\\/(?!\\/|${escapedBase}(?:\\/|"))`,
+          '(["])\\/(?!\\/|' +
+          escapedBase +
+          '(?:\\/|"))',
           "g"
         ),
-        `$1${BASE}/`
+        '$1' + BASE + "/"
       );
 
       // ----------------------------------------------------------
-      // Single-quoted strings
+      // Stage 1:
+      // Single-quoted root-relative strings
       // ----------------------------------------------------------
 
       body = body.replace(
         new RegExp(
-          `(['])\\/(?!\\/|${escapedBase}(?:\\/|'))`,
+          "(['])\\/(?!\\/|" +
+          escapedBase +
+          "(?:\\/|'))",
           "g"
         ),
-        `$1${BASE}/`
+        "$1" + BASE + "/"
       );
 
       // ----------------------------------------------------------
+      // Stage 1:
       // Template literals
       //
-      // `/api/${id}`
+      // Example:
+      //
+      // `/api/users/${id}`
       //
       // becomes:
       //
-      // `/verification/api/${id}`
+      // `/verification/api/users/${id}`
       // ----------------------------------------------------------
 
       body = body.replace(
@@ -337,8 +434,63 @@ export default {
           "(?:\\/|`))",
           "g"
         ),
-        `$1${BASE}/`
+        "$1" + BASE + "/"
       );
+
+      // ----------------------------------------------------------
+      // Stage 2:
+      //
+      // Some generated applications may contain strings written
+      // with escaped slashes:
+      //
+      // "\\/api/test"
+      //
+      // Handle those as well.
+      // ----------------------------------------------------------
+
+      body = body.replace(
+        new RegExp(
+          '(["\'])\\\\\\/(?!\\\\\\/|' +
+          escapedBase +
+          '(?:\\\\\\/|["\']))',
+          "g"
+        ),
+        "$1\\/" + BASE + "/"
+      );
+
+      // ----------------------------------------------------------
+      // Stage 2:
+      //
+      // Handle root-relative URLs inside common URL objects:
+      //
+      // new URL("/api/test", ...)
+      //
+      // The string rewrite above normally catches this already,
+      // but keeping this explicit makes the intention clear and
+      // provides a fallback for slightly unusual generated code.
+      // ----------------------------------------------------------
+
+      body = body.replace(
+        new RegExp(
+          '(new\\s+URL\\(\\s*["\'])\\/(?!\\/|' +
+          escapedBase +
+          '\\/)',
+          "g"
+        ),
+        "$1" + BASE + "/"
+      );
+
+      // ----------------------------------------------------------
+      // Stage 2:
+      //
+      // Common XMLHttpRequest.open:
+      //
+      // xhr.open("GET", "/api/test")
+      //
+      // is already covered by the string rewrite above.
+      //
+      // No additional transformation is necessary.
+      // ----------------------------------------------------------
 
       return new Response(body, {
         status: response.status,
@@ -348,13 +500,14 @@ export default {
     }
 
     // ============================================================
-    // 11. CSS
+    // 12. CSS rewriting
+    // ============================================================
     //
-    // Rewrite:
+    // Example:
     //
     // url("/images/logo.svg")
     //
-    // to:
+    // becomes:
     //
     // url("/verification/images/logo.svg")
     // ============================================================
@@ -373,7 +526,7 @@ export default {
 
       body = body.replace(
         new RegExp(
-          `url\$begin:math:text$\\\\s\*\(\[\"\'\]\?\)\\\\\/\(\?\!\\\\\/\|\$\{escapedBase\}\\\\\/\)\(\[\^\)\"\'\]\+\)\\\\1\\\\s\*\\$end:math:text$`,
+          `url\\(\\s*(["']?)\\/(?!\\/|${escapedBase}\\/)([^)"']+)\\1\\s*\\)`,
           "g"
         ),
         `url($1${BASE}/$2$1)`
@@ -387,7 +540,7 @@ export default {
     }
 
     // ============================================================
-    // 12. Everything else passes through unchanged
+    // 13. Everything else passes through unchanged
     // ============================================================
 
     return new Response(response.body, {
