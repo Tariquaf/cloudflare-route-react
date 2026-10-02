@@ -369,7 +369,7 @@ export default {
     // ============================================================
 
     if (
-      BASE &&
+      false && BASE &&
       (
         contentType.includes("javascript") ||
         contentType.includes("ecmascript") ||
